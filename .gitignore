@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# Selenium & WebDriver
+chromedriver
+geckodriver
+*.log
+selenium-debug.log
+
+# Data files (collected odds data)
+data/
+*.json
+!example_data.json  # Keep example files if you add any
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+
+# Jupyter Notebooks (if you add analysis notebooks later)
+.ipynb_checkpoints/
+*.ipynb
+
+# Screenshots (if scraper takes debug screenshots)
+screenshots/
+*.png
+*.jpg
+
+# Pytest & Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# MyPy type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Credentials (just in case)
+credentials.json
+secrets.json
+*.key
+*.pem
