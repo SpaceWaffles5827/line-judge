@@ -1,5 +1,6 @@
 """
-compare_odds.py - Compare odds across multiple sportsbooks in real-time with arbitrage detection
+linejudge.py - Compare odds across multiple sportsbooks in real-time with arbitrage detection
+PRODUCTION VERSION with stale data prevention, health monitoring, and comprehensive error handling
 SUPPORTS 2+ SPORTSBOOKS FOR OPTIMAL ARBITRAGE DETECTION
 """
 from selenium import webdriver
@@ -7,79 +8,225 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from scrapers import ScraperFactory
 from threading import Thread, Lock
 from collections import defaultdict
+import logging
+from typing import Optional, Dict, List
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('odds_comparison.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 
 class OddsComparator:
     def __init__(self):
         self.odds_lock = Lock()
         self.current_odds = {}
+        self.match_status = {}  # Track health of each match
         self.odds_history = {
             'start_time': datetime.now().isoformat(),
             'matches': [],
             'comparisons': [],
-            'arbitrage_opportunities': []
+            'arbitrage_opportunities': [],
+            'errors': []
         }
         self.running = True
         self.arbitrage_found = False
+        self.consecutive_failures = {}  # Track consecutive failures per match
+        self.last_successful_fetch = {}  # Track last successful fetch time
+        
+        # Configuration
+        self.MAX_FAILURES_BEFORE_ALERT = 5
+        self.STALE_DATA_THRESHOLD = 30  # seconds
+        self.MAX_STALE_TIME = 60  # seconds - after this, data is invalid
         
     def setup_driver(self):
         """Setup Chrome driver with options"""
         options = webdriver.ChromeOptions()
         options.add_argument('--disable-blink-features=AutomationControlled')
         options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
-        options.add_argument('--headless')  # Run in background
+        options.add_argument('--headless')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-logging')
+        options.add_argument('--log-level=3')
         
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
+        driver.set_page_load_timeout(30)
         return driver
     
+    def _log_error(self, match_id: int, sportsbook: str, error: str, exception: Exception = None):
+        """Log error to both logger and history"""
+        error_entry = {
+            'timestamp': datetime.now().isoformat(),
+            'match_id': match_id,
+            'sportsbook': sportsbook,
+            'error': error,
+            'exception': str(exception) if exception else None
+        }
+        self.odds_history['errors'].append(error_entry)
+        
+        if exception:
+            logger.error(f"Match {match_id} ({sportsbook}): {error} - {exception}")
+        else:
+            logger.warning(f"Match {match_id} ({sportsbook}): {error}")
+    
+    def _update_match_status(self, match_id: int, status: str, message: str = None):
+        """Update match status with timestamp"""
+        with self.odds_lock:
+            self.match_status[match_id] = {
+                'status': status,
+                'timestamp': datetime.now().isoformat(),
+                'message': message
+            }
+    
+    def _is_data_stale(self, match_id: int) -> bool:
+        """Check if data for a match is stale based on last successful fetch"""
+        if match_id not in self.last_successful_fetch:
+            return True
+        
+        time_since_fetch = (datetime.now() - self.last_successful_fetch[match_id]).total_seconds()
+        return time_since_fetch > self.STALE_DATA_THRESHOLD
+    
+    def _is_data_invalid(self, match_id: int) -> bool:
+        """Check if data is too old to be usable"""
+        if match_id not in self.last_successful_fetch:
+            return True
+        
+        time_since_fetch = (datetime.now() - self.last_successful_fetch[match_id]).total_seconds()
+        return time_since_fetch > self.MAX_STALE_TIME
+    
     def monitor_single_match(self, url: str, match_id: int, interval: int = 1):
-        """Monitor a single match in a separate thread"""
+        """Monitor a single match in a separate thread with comprehensive error handling"""
         factory = ScraperFactory()
         scraper = factory.get_scraper(url)
         
         if not scraper:
-            print(f"❌ Match {match_id}: Unsupported URL")
+            logger.error(f"Match {match_id}: Unsupported URL - {url}")
+            self._update_match_status(match_id, 'error', 'Unsupported URL')
             return
         
         sportsbook = scraper.get_sportsbook_name()
-        print(f"✅ Match {match_id}: {sportsbook}")
+        logger.info(f"Match {match_id}: Initialized {sportsbook}")
+        self._update_match_status(match_id, 'initializing', f'Starting {sportsbook}')
         
-        driver = self.setup_driver()
+        driver = None
+        self.consecutive_failures[match_id] = 0
         
         try:
+            driver = self.setup_driver()
+            logger.info(f"Match {match_id} ({sportsbook}): Loading page...")
             driver.get(url)
             scraper.wait_for_page_load(driver)
             
+            self._update_match_status(match_id, 'active', 'Page loaded successfully')
+            logger.info(f"Match {match_id} ({sportsbook}): Ready to fetch odds")
+            
             iteration = 0
+            last_warning = 0
+            
             while self.running:
-                odds = scraper.get_odds(driver)
-                iteration += 1
+                try:
+                    odds = scraper.get_odds(driver)
+                    iteration += 1
+                    current_time = time.time()
+                    
+                    if odds and len(odds) > 0:
+                        # Successful fetch - reset failure counter
+                        self.consecutive_failures[match_id] = 0
+                        
+                        with self.odds_lock:
+                            self.current_odds[match_id] = {
+                                'sportsbook': sportsbook,
+                                'url': url,
+                                'timestamp': datetime.now().isoformat(),
+                                'odds': odds,
+                                'status': 'active',
+                                'iteration': iteration
+                            }
+                            self.last_successful_fetch[match_id] = datetime.now()
+                        
+                        self._update_match_status(match_id, 'active', f'{len(odds)} players tracked')
+                        
+                        if iteration % 20 == 0:
+                            logger.debug(f"Match {match_id} ({sportsbook}): Iteration {iteration} - {len(odds)} players")
+                    
+                    else:
+                        # Failed to get odds
+                        self.consecutive_failures[match_id] += 1
+                        
+                        # Mark as stale but keep last known data
+                        with self.odds_lock:
+                            if match_id in self.current_odds:
+                                self.current_odds[match_id]['status'] = 'stale'
+                                self.current_odds[match_id]['last_error'] = datetime.now().isoformat()
+                                self.current_odds[match_id]['consecutive_failures'] = self.consecutive_failures[match_id]
+                        
+                        # Throttled warnings
+                        if current_time - last_warning >= 10:
+                            warning_msg = f"Failed to extract odds (attempt {self.consecutive_failures[match_id]})"
+                            
+                            if self.consecutive_failures[match_id] >= self.MAX_FAILURES_BEFORE_ALERT:
+                                logger.error(f"Match {match_id} ({sportsbook}): {warning_msg} - CRITICAL")
+                                self._update_match_status(match_id, 'failing', warning_msg)
+                                self._log_error(match_id, sportsbook, f"Consecutive failures: {self.consecutive_failures[match_id]}")
+                            else:
+                                logger.warning(f"Match {match_id} ({sportsbook}): {warning_msg}")
+                                self._update_match_status(match_id, 'warning', warning_msg)
+                            
+                            last_warning = current_time
+                        
+                        # If too many failures, try refreshing page
+                        if self.consecutive_failures[match_id] >= 10 and self.consecutive_failures[match_id] % 10 == 0:
+                            logger.info(f"Match {match_id} ({sportsbook}): Attempting page refresh...")
+                            try:
+                                driver.refresh()
+                                scraper.wait_for_page_load(driver)
+                                self._update_match_status(match_id, 'recovering', 'Page refreshed')
+                            except Exception as e:
+                                logger.error(f"Match {match_id} ({sportsbook}): Refresh failed - {e}")
                 
-                if odds:
+                except Exception as e:
+                    self.consecutive_failures[match_id] += 1
+                    logger.error(f"Match {match_id} ({sportsbook}): Iteration error - {e}")
+                    self._log_error(match_id, sportsbook, f"Iteration {iteration} error", e)
+                    
                     with self.odds_lock:
-                        self.current_odds[match_id] = {
-                            'sportsbook': sportsbook,
-                            'url': url,
-                            'timestamp': datetime.now().isoformat(),
-                            'odds': odds
-                        }
-                elif iteration % 10 == 0:
-                    print(f"⚠️  Match {match_id} ({sportsbook}): Still trying to extract odds...")
+                        if match_id in self.current_odds:
+                            self.current_odds[match_id]['status'] = 'error'
+                    
+                    self._update_match_status(match_id, 'error', str(e))
                 
                 time.sleep(interval)
         
         except Exception as e:
-            print(f"❌ Match {match_id} ({sportsbook}) error: {e}")
+            error_msg = f"Fatal error in monitoring thread: {e}"
+            logger.error(f"Match {match_id} ({sportsbook}): {error_msg}")
+            self._log_error(match_id, sportsbook, error_msg, e)
+            self._update_match_status(match_id, 'crashed', error_msg)
+            
             import traceback
             traceback.print_exc()
         
         finally:
-            driver.quit()
+            if driver:
+                try:
+                    driver.quit()
+                    logger.info(f"Match {match_id} ({sportsbook}): Driver closed cleanly")
+                except Exception as e:
+                    logger.error(f"Match {match_id} ({sportsbook}): Error closing driver - {e}")
     
     def normalize_player_name(self, name: str) -> str:
         """Normalize player names for matching - handles both full and abbreviated names"""
@@ -98,7 +245,7 @@ class OddsComparator:
         
         return name
     
-    def calculate_arbitrage(self, player_odds_data: dict) -> dict:
+    def calculate_arbitrage(self, player_odds_data: dict) -> Optional[dict]:
         """
         Calculate arbitrage opportunity across ALL sportsbooks
         Works with 2+ sportsbooks by finding best odds for each player
@@ -186,7 +333,7 @@ class OddsComparator:
         
         return None
     
-    def _find_cross_book_arbitrage(self, player_odds_data: dict) -> dict:
+    def _find_cross_book_arbitrage(self, player_odds_data: dict) -> Optional[dict]:
         """
         Fallback method to find arbitrage when best odds are on same book
         Checks all cross-book combinations
@@ -251,27 +398,60 @@ class OddsComparator:
         return best_arb
     
     def compare_and_display(self):
-        """Compare odds and display differences"""
+        """Compare odds and display differences - with stale data filtering"""
         with self.odds_lock:
             num_books = len(self.current_odds)
             if num_books < 2:
                 print(f"⚠️  Waiting for data from sportsbooks... ({num_books} ready, need 2+)")
                 return
             
-            matches = list(self.current_odds.values())
+            # Filter out invalid (too old) data
+            valid_matches = []
+            stale_matches = []
+            invalid_matches = []
             
-            has_data = all(match.get('odds') for match in matches)
+            for match_id, match in self.current_odds.items():
+                if self._is_data_invalid(match_id):
+                    invalid_matches.append((match_id, match))
+                elif match.get('status') == 'stale' or self._is_data_stale(match_id):
+                    stale_matches.append((match_id, match))
+                else:
+                    valid_matches.append(match)
+            
+            # Display warnings for problematic matches
+            if stale_matches:
+                print(f"⚠️  {len(stale_matches)} sportsbook(s) with stale data (>{self.STALE_DATA_THRESHOLD}s old):")
+                for match_id, match in stale_matches:
+                    age = (datetime.now() - self.last_successful_fetch[match_id]).total_seconds()
+                    print(f"   - {match['sportsbook']}: {age:.0f}s since last update")
+            
+            if invalid_matches:
+                print(f"❌ {len(invalid_matches)} sportsbook(s) with invalid data (>{self.MAX_STALE_TIME}s old) - EXCLUDING:")
+                for match_id, match in invalid_matches:
+                    age = (datetime.now() - self.last_successful_fetch[match_id]).total_seconds() if match_id in self.last_successful_fetch else float('inf')
+                    print(f"   - {match['sportsbook']}: {age:.0f}s since last update")
+            
+            # Only use valid, fresh data for comparisons
+            active_matches = valid_matches
+            
+            if len(active_matches) < 2:
+                print(f"⚠️  Not enough active sportsbooks with fresh data ({len(active_matches)}/2 minimum)")
+                print(f"   Total tracked: {num_books} | Active: {len(active_matches)} | Stale: {len(stale_matches)} | Invalid: {len(invalid_matches)}")
+                return
+            
+            # Check if all active matches have odds
+            has_data = all(match.get('odds') for match in active_matches)
             if not has_data:
-                print(f"⚠️  Waiting for odds data from all sources...")
-                for idx, match in enumerate(matches, 1):
+                print(f"⚠️  Waiting for odds data from all active sources...")
+                for idx, match in enumerate(active_matches, 1):
                     odds_count = len(match.get('odds', []))
                     print(f"   Match {idx} ({match['sportsbook']}): {odds_count} players found")
                 return
             
-            # Create player mapping
+            # Create player mapping from ONLY valid data
             player_odds = defaultdict(dict)
             
-            for match in matches:
+            for match in active_matches:
                 sportsbook = match['sportsbook']
                 for player_data in match['odds']:
                     player_name = player_data['player']
@@ -290,7 +470,7 @@ class OddsComparator:
             if not matching_players:
                 print(f"⚠️  No matching players found across sportsbooks")
                 print(f"\n   Players found:")
-                for match in matches:
+                for match in active_matches:
                     print(f"   {match['sportsbook']}:")
                     for player_data in match['odds']:
                         normalized = self.normalize_player_name(player_data['player'])
@@ -302,14 +482,20 @@ class OddsComparator:
             
             # Display comparison
             timestamp = datetime.now().strftime("%H:%M:%S")
-            sportsbooks_str = ', '.join([m['sportsbook'] for m in matches])
+            sportsbooks_str = ', '.join([m['sportsbook'] for m in active_matches])
             print(f"\n{'='*80}")
-            print(f"⏰ [{timestamp}] 📊 ODDS COMPARISON ({num_books} sportsbooks)")
+            print(f"⏰ [{timestamp}] 📊 ODDS COMPARISON ({len(active_matches)} active sportsbooks)")
             print(f"{'='*80}")
             print(f"📚 Books: {sportsbooks_str}")
             
+            if stale_matches:
+                print(f"⚠️  Stale: {', '.join([m['sportsbook'] for _, m in stale_matches])}")
+            
             comparison_data = {
                 'timestamp': datetime.now().isoformat(),
+                'active_books': len(active_matches),
+                'stale_books': len(stale_matches),
+                'invalid_books': len(invalid_matches),
                 'players': {},
                 'arbitrage': None
             }
@@ -374,6 +560,7 @@ class OddsComparator:
                 if not self.arbitrage_found:
                     self.arbitrage_found = True
                     print(f"\n🚨 🚨 🚨 ARBITRAGE OPPORTUNITY DETECTED! 🚨 🚨 🚨\n")
+                    logger.info(f"ARBITRAGE FOUND: {arbitrage['profit_percentage']:.3f}% profit")
                 
                 print(f"✅ ARBITRAGE EXISTS!")
                 print(f"   Profit: {arbitrage['profit_percentage']:.3f}% (${arbitrage['profit_amount']:.2f} on $100)")
@@ -453,32 +640,82 @@ class OddsComparator:
         filepath = data_dir / filename
         
         self.odds_history['end_time'] = datetime.now().isoformat()
+        self.odds_history['match_status'] = self.match_status
+        self.odds_history['total_errors'] = len(self.odds_history['errors'])
         
         with open(filepath, 'w') as f:
             json.dump(self.odds_history, f, indent=2)
         
         return filepath
     
+    def get_health_summary(self) -> dict:
+        """Get current health status of all monitored matches"""
+        with self.odds_lock:
+            summary = {
+                'total_matches': len(self.current_odds),
+                'active': 0,
+                'stale': 0,
+                'invalid': 0,
+                'error': 0,
+                'details': []
+            }
+            
+            for match_id, match in self.current_odds.items():
+                status = match.get('status', 'unknown')
+                
+                if status == 'active' and not self._is_data_stale(match_id):
+                    summary['active'] += 1
+                elif self._is_data_invalid(match_id):
+                    summary['invalid'] += 1
+                elif status == 'stale' or self._is_data_stale(match_id):
+                    summary['stale'] += 1
+                elif status == 'error':
+                    summary['error'] += 1
+                
+                detail = {
+                    'match_id': match_id,
+                    'sportsbook': match.get('sportsbook'),
+                    'status': status,
+                    'consecutive_failures': self.consecutive_failures.get(match_id, 0),
+                    'last_update': match.get('timestamp')
+                }
+                
+                if match_id in self.last_successful_fetch:
+                    age = (datetime.now() - self.last_successful_fetch[match_id]).total_seconds()
+                    detail['age_seconds'] = age
+                
+                summary['details'].append(detail)
+            
+            return summary
+    
     def run(self, urls: list, interval: int = 2, display_interval: int = 5):
-        """Run comparison monitoring - supports 2+ sportsbooks"""
+        """Run comparison monitoring - supports 2+ sportsbooks with health monitoring"""
         print("🎾 LineJudge - Multi-Sportsbook Odds Comparison & Arbitrage Detector")
         print("=" * 80)
         print(f"📊 Comparing {len(urls)} sportsbooks")
         print(f"⏱️  Fetch interval: {interval}s | Display interval: {display_interval}s")
         print(f"💎 Arbitrage detection: ENABLED")
         print(f"🔍 Strategy: Find best odds across ALL books for each player")
+        print(f"⏰ Stale data threshold: {self.STALE_DATA_THRESHOLD}s | Invalid after: {self.MAX_STALE_TIME}s")
+        print(f"📝 Logging to: odds_comparison.log")
         print("Press Ctrl+C to stop\n")
+        
+        logger.info("="*80)
+        logger.info(f"Starting odds comparison for {len(urls)} sportsbooks")
         
         for idx, url in enumerate(urls, 1):
             factory = ScraperFactory()
             scraper = factory.get_scraper(url)
             if scraper:
-                self.odds_history['matches'].append({
+                match_info = {
                     'match_id': idx,
                     'sportsbook': scraper.get_sportsbook_name(),
                     'url': url
-                })
+                }
+                self.odds_history['matches'].append(match_info)
+                logger.info(f"Match {idx}: {match_info['sportsbook']}")
         
+        # Start monitoring threads
         threads = []
         for idx, url in enumerate(urls, 1):
             thread = Thread(target=self.monitor_single_match, args=(url, idx, interval))
@@ -490,37 +727,60 @@ class OddsComparator:
         
         try:
             last_display = 0
+            last_health_check = 0
+            
             while True:
                 current_time = time.time()
+                
+                # Display odds comparison
                 if current_time - last_display >= display_interval:
                     self.compare_and_display()
                     last_display = current_time
+                
+                # Health check every 30 seconds
+                if current_time - last_health_check >= 30:
+                    health = self.get_health_summary()
+                    logger.info(f"Health: {health['active']} active, {health['stale']} stale, {health['invalid']} invalid, {health['error']} error")
+                    last_health_check = current_time
                 
                 time.sleep(1)
         
         except KeyboardInterrupt:
             print("\n\n⏹️  Stopping comparison...")
+            logger.info("Shutdown initiated by user")
             self.running = False
             
+            # Wait for threads to finish
             for thread in threads:
                 thread.join(timeout=2)
             
+            # Final health summary
+            health = self.get_health_summary()
+            print(f"\n📊 Final Health Summary:")
+            print(f"   Total matches: {health['total_matches']}")
+            print(f"   Active: {health['active']} | Stale: {health['stale']} | Invalid: {health['invalid']} | Error: {health['error']}")
+            
             if self.odds_history['comparisons']:
                 filepath = self.save_comparison_data()
-                print(f"💾 Comparison data saved to: {filepath}")
+                print(f"\n💾 Comparison data saved to: {filepath}")
                 print(f"📈 Total comparisons: {len(self.odds_history['comparisons'])}")
+                print(f"⚠️  Total errors logged: {len(self.odds_history['errors'])}")
                 
                 if self.odds_history['arbitrage_opportunities']:
-                    print(f"💎 Arbitrage opportunities found: {len(self.odds_history['arbitrage_opportunities'])}")
+                    print(f"\n💎 Arbitrage opportunities found: {len(self.odds_history['arbitrage_opportunities'])}")
                     profits = [opp['arbitrage']['profit_percentage'] for opp in self.odds_history['arbitrage_opportunities']]
                     print(f"   Best profit: {max(profits):.3f}%")
                     print(f"   Average profit: {sum(profits)/len(profits):.3f}%")
                 else:
                     print(f"❌ No arbitrage opportunities detected")
+                
+                logger.info(f"Session complete. {len(self.odds_history['comparisons'])} comparisons, {len(self.odds_history['arbitrage_opportunities'])} arbitrage opportunities")
             else:
                 print("⚠️  No comparison data collected")
+                logger.warning("Session ended with no comparison data")
             
             print("✅ Comparison complete. Thanks for using LineJudge!")
+
 
 def show_help():
     """Show usage examples"""
@@ -528,13 +788,13 @@ def show_help():
 📖 Usage Examples:
 
 1. Compare matches (interactive - supports 2+ sportsbooks):
-   python compare_odds.py
+   python linejudge.py
 
 2. Compare with custom intervals:
-   python compare_odds.py --fetch-interval 2 --display-interval 10
+   python linejudge.py --fetch-interval 2 --display-interval 10
 
 3. Compare 3+ sportsbooks (CLI):
-   python compare_odds.py \\
+   python linejudge.py \\
      "https://sportsbook.draftkings.com/event/..." \\
      "https://www.nv.betmgm.com/en/sports/events/..." \\
      "https://www.pinnacle.com/en/tennis/..."
@@ -545,6 +805,7 @@ def show_help():
 - The script automatically finds the best odds across all books
 - Arbitrage detected when combined probability < 100%
 - All data is saved to data/comparison_*.json
+- Logs are written to odds_comparison.log
 
 💎 About Arbitrage:
 - Arbitrage exists when you can bet on all outcomes and guarantee profit
@@ -556,7 +817,15 @@ def show_help():
 - 2 books: 15-25% chance of arbitrage
 - 3 books: 35-50% chance of arbitrage
 - 5+ books: 60-75% chance of arbitrage
+
+🛡️ Production Features:
+- Automatic stale data detection and filtering
+- Health monitoring of all data sources
+- Comprehensive error logging
+- Graceful handling of dead/expired pages
+- No false arbitrage alerts from stale data
 """)
+
 
 if __name__ == "__main__":
     import sys
