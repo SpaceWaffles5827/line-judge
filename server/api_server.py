@@ -1,6 +1,5 @@
 """
-FastAPI Backend for LineJudge Web Interface
-Provides REST API and WebSocket support to control the odds comparison system
+FastAPI Backend for LineJudge Web Interface - Multi-Match Support (Single User)
 """
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,20 +10,16 @@ import uuid
 import threading
 import time
 from datetime import datetime
-import json
-from pathlib import Path
+from collections import defaultdict
 import logging
 
-# Import your existing comparison code
 from linejudge import OddsComparator
 
-# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="LineJudge API", version="1.0.0")
+app = FastAPI(title="LineJudge API", version="2.0.0")
 
-# CORS middleware for Next.js
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -33,56 +28,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Active sessions storage
-active_sessions: Dict[str, Dict[str, Any]] = {}
-websocket_connections: Dict[str, List[WebSocket]] = {}
+# Simple storage - just matches
+active_matches: Dict[str, Dict[str, Any]] = {}  # matchId -> match data
+websocket_connections: List[WebSocket] = []  # All websocket connections
 
 
 # Pydantic models
-class StartSessionRequest(BaseModel):
+class CreateMatchRequest(BaseModel):
     urls: List[str]
+    matchName: Optional[str] = None
+    sport: Optional[str] = None
     fetchInterval: int = 2
     displayInterval: int = 5
 
 
-class SessionResponse(BaseModel):
-    sessionId: str
+class MatchResponse(BaseModel):
+    matchId: str
+    matchName: str
     status: str
     message: str
 
 
-class SessionStatusResponse(BaseModel):
-    sessionId: str
-    status: str
-    startTime: str
-    currentOdds: Dict[str, Any]
-    latestArbitrage: Optional[Dict[str, Any]]
-    totalComparisons: int
-    totalArbitrageOpportunities: int
-    matchStatus: Dict[str, Any]
-
-
-# Background task to broadcast updates
-async def broadcast_updates(session_id: str):
-    """Continuously broadcast session updates to connected WebSocket clients"""
-    while session_id in active_sessions and active_sessions[session_id]["status"] == "running":
+# Background broadcast for a specific match
+async def broadcast_match_updates(match_id: str):
+    """Continuously broadcast match updates to connected WebSocket clients"""
+    while match_id in active_matches and active_matches[match_id]["status"] == "running":
         try:
-            session = active_sessions[session_id]
-            comparator = session["comparator"]
+            match = active_matches[match_id]
+            comparator = match["comparator"]
             
-            # Get current state
             with comparator.odds_lock:
                 current_odds = dict(comparator.current_odds)
             
-            # Get latest arbitrage
             latest_arbitrage = None
             if comparator.odds_history['arbitrage_opportunities']:
                 latest_arbitrage = comparator.odds_history['arbitrage_opportunities'][-1]['arbitrage']
             
-            # Prepare update payload
             update = {
-                "type": "update",
-                "sessionId": session_id,
+                "type": "match_update",
+                "matchId": match_id,
                 "currentOdds": current_odds,
                 "latestArbitrage": latest_arbitrage,
                 "totalComparisons": len(comparator.odds_history['comparisons']),
@@ -91,72 +75,64 @@ async def broadcast_updates(session_id: str):
                 "timestamp": datetime.now().isoformat()
             }
             
-            # Broadcast to all connected clients for this session
-            if session_id in websocket_connections:
-                disconnected = []
-                for ws in websocket_connections[session_id]:
-                    try:
-                        await ws.send_json(update)
-                    except Exception as e:
-                        logger.error(f"Error sending to websocket: {e}")
-                        disconnected.append(ws)
-                
-                # Remove disconnected clients
-                for ws in disconnected:
-                    websocket_connections[session_id].remove(ws)
+            # Broadcast to all websocket connections
+            disconnected = []
+            for ws in websocket_connections:
+                try:
+                    await ws.send_json(update)
+                except Exception as e:
+                    logger.error(f"Error sending to websocket: {e}")
+                    disconnected.append(ws)
             
-            await asyncio.sleep(2)  # Broadcast every 2 seconds
+            for ws in disconnected:
+                if ws in websocket_connections:
+                    websocket_connections.remove(ws)
+            
+            await asyncio.sleep(2)
             
         except Exception as e:
-            logger.error(f"Error in broadcast loop: {e}")
+            logger.error(f"Error in broadcast loop for match {match_id}: {e}")
             await asyncio.sleep(2)
 
 
-def run_comparator_thread(session_id: str, urls: List[str], fetch_interval: int, display_interval: int):
-    """Run the OddsComparator in a separate thread"""
+def run_match_comparator(match_id: str, urls: List[str], fetch_interval: int, display_interval: int):
+    """Run comparator for a specific match in a separate thread"""
     try:
-        session = active_sessions[session_id]
-        comparator = session["comparator"]
-        
-        # Override the compare_and_display method to not print to console
-        original_compare_and_display = comparator.compare_and_display
+        match = active_matches[match_id]
+        comparator = match["comparator"]
         
         def silent_compare_and_display():
-            """Silent version that updates data without printing"""
             with comparator.odds_lock:
                 num_books = len(comparator.current_odds)
                 if num_books < 2:
                     return
                 
-                # Filter out invalid data
-                from collections import defaultdict
                 valid_matches = []
                 stale_matches = []
                 invalid_matches = []
                 
-                for match_id, match in comparator.current_odds.items():
-                    if comparator._is_data_invalid(match_id):
-                        invalid_matches.append((match_id, match))
-                    elif match.get('status') == 'stale' or comparator._is_data_stale(match_id):
-                        stale_matches.append((match_id, match))
+                for match_id_inner, match_data in comparator.current_odds.items():
+                    if comparator._is_data_invalid(match_id_inner):
+                        invalid_matches.append((match_id_inner, match_data))
+                    elif match_data.get('status') == 'stale' or comparator._is_data_stale(match_id_inner):
+                        stale_matches.append((match_id_inner, match_data))
                     else:
-                        valid_matches.append(match)
+                        valid_matches.append(match_data)
                 
-                active_matches = valid_matches
+                active_matches_data = valid_matches
                 
-                if len(active_matches) < 2:
+                if len(active_matches_data) < 2:
                     return
                 
-                has_data = all(match.get('odds') for match in active_matches)
+                has_data = all(m.get('odds') for m in active_matches_data)
                 if not has_data:
                     return
                 
-                # Create player mapping
                 player_odds = defaultdict(dict)
                 
-                for match in active_matches:
-                    sportsbook = match['sportsbook']
-                    for player_data in match['odds']:
+                for match_data in active_matches_data:
+                    sportsbook = match_data['sportsbook']
+                    for player_data in match_data['odds']:
                         player_name = player_data['player']
                         normalized_name = comparator.normalize_player_name(player_name)
                         odds_value = player_data['odds']
@@ -172,20 +148,17 @@ def run_comparator_thread(session_id: str, urls: List[str], fetch_interval: int,
                 if not matching_players:
                     return
                 
-                # Calculate arbitrage
                 arbitrage = comparator.calculate_arbitrage(player_odds)
                 
-                # Store comparison data
                 comparison_data = {
                     'timestamp': datetime.now().isoformat(),
-                    'active_books': len(active_matches),
+                    'active_books': len(active_matches_data),
                     'stale_books': len(stale_matches),
                     'invalid_books': len(invalid_matches),
                     'players': {},
                     'arbitrage': arbitrage
                 }
                 
-                # Store player data
                 for player, books in player_odds.items():
                     if len(books) >= 2:
                         player_comparison = {}
@@ -208,16 +181,14 @@ def run_comparator_thread(session_id: str, urls: List[str], fetch_interval: int,
                     
                     if not comparator.arbitrage_found:
                         comparator.arbitrage_found = True
-                        logger.info(f"ARBITRAGE FOUND in session {session_id}: {arbitrage['profit_percentage']:.3f}% profit")
+                        logger.info(f"ARBITRAGE in match {match_id}: {arbitrage['profit_percentage']:.3f}%")
                 
                 comparator.odds_history['comparisons'].append(comparison_data)
         
         comparator.compare_and_display = silent_compare_and_display
         
-        # Start monitoring
-        logger.info(f"Starting comparator thread for session {session_id}")
+        logger.info(f"Starting comparator for match {match_id}")
         
-        # Initialize scrapers and start threads
         from scrapers import ScraperFactory
         from threading import Thread
         
@@ -231,9 +202,7 @@ def run_comparator_thread(session_id: str, urls: List[str], fetch_interval: int,
                     'url': url
                 }
                 comparator.odds_history['matches'].append(match_info)
-                logger.info(f"Match {idx}: {match_info['sportsbook']}")
         
-        # Start monitoring threads
         threads = []
         for idx, url in enumerate(urls, 1):
             thread = Thread(target=comparator.monitor_single_match, args=(url, idx, fetch_interval))
@@ -243,54 +212,49 @@ def run_comparator_thread(session_id: str, urls: List[str], fetch_interval: int,
         
         time.sleep(2)
         
-        # Main comparison loop
         last_display = 0
         last_health_check = 0
         
-        while comparator.running and session["status"] == "running":
+        while comparator.running and match["status"] == "running":
             current_time = time.time()
             
-            # Run comparison
             if current_time - last_display >= display_interval:
                 comparator.compare_and_display()
                 last_display = current_time
             
-            # Health check
             if current_time - last_health_check >= 30:
                 health = comparator.get_health_summary()
-                logger.info(f"Session {session_id} Health: {health['active']} active, {health['stale']} stale")
+                logger.info(f"Match {match_id}: {health['active']} active, {health['stale']} stale")
                 last_health_check = current_time
             
             time.sleep(1)
         
-        # Cleanup
-        logger.info(f"Stopping session {session_id}")
+        logger.info(f"Stopping match {match_id}")
         comparator.running = False
         
         for thread in threads:
             thread.join(timeout=2)
         
-        # Save data
         if comparator.odds_history['comparisons']:
             filepath = comparator.save_comparison_data()
-            session["data_file"] = str(filepath)
-            logger.info(f"Session {session_id} data saved to {filepath}")
+            match["data_file"] = str(filepath)
+            logger.info(f"Match {match_id} data saved to {filepath}")
         
     except Exception as e:
-        logger.error(f"Error in comparator thread for session {session_id}: {e}")
+        logger.error(f"Error in match {match_id}: {e}")
         import traceback
         traceback.print_exc()
-        active_sessions[session_id]["status"] = "error"
-        active_sessions[session_id]["error"] = str(e)
+        active_matches[match_id]["status"] = "error"
+        active_matches[match_id]["error"] = str(e)
 
 
 # API Endpoints
 @app.get("/")
 async def root():
     return {
-        "message": "LineJudge API v1.0",
+        "message": "LineJudge API v2.0 - Single User",
         "status": "operational",
-        "active_sessions": len(active_sessions)
+        "active_matches": len(active_matches)
     }
 
 
@@ -298,201 +262,62 @@ async def root():
 async def health_check():
     return {
         "status": "healthy",
-        "active_sessions": len(active_sessions),
-        "sessions": {
-            sid: {"status": s["status"], "urls": len(s["urls"])}
-            for sid, s in active_sessions.items()
-        }
+        "active_matches": len(active_matches)
     }
 
 
-@app.post("/start", response_model=SessionResponse)
-async def start_session(request: StartSessionRequest):
-    """Start a new odds comparison session"""
+@app.post("/match/create", response_model=MatchResponse)
+async def create_match(request: CreateMatchRequest):
+    """Create a new match"""
     if len(request.urls) < 2:
         raise HTTPException(status_code=400, detail="At least 2 URLs required")
     
-    session_id = str(uuid.uuid4())
+    match_id = str(uuid.uuid4())
+    match_name = request.matchName or f"Match {len(active_matches) + 1}"
     
-    # Create comparator instance
     comparator = OddsComparator()
     
-    # Store session
-    active_sessions[session_id] = {
-        "id": session_id,
+    active_matches[match_id] = {
+        "matchId": match_id,
+        "matchName": match_name,
+        "sport": request.sport,
         "urls": request.urls,
         "comparator": comparator,
         "status": "running",
-        "start_time": datetime.now().isoformat(),
-        "fetch_interval": request.fetchInterval,
-        "display_interval": request.displayInterval
+        "startTime": datetime.now().isoformat(),
+        "fetchInterval": request.fetchInterval,
+        "displayInterval": request.displayInterval
     }
     
-    # Start comparator in background thread
+    # Start comparator thread
     thread = threading.Thread(
-        target=run_comparator_thread,
-        args=(session_id, request.urls, request.fetchInterval, request.displayInterval),
+        target=run_match_comparator,
+        args=(match_id, request.urls, request.fetchInterval, request.displayInterval),
         daemon=True
     )
     thread.start()
-    active_sessions[session_id]["thread"] = thread
+    active_matches[match_id]["thread"] = thread
     
-    # Start WebSocket broadcast task
-    asyncio.create_task(broadcast_updates(session_id))
+    # Start broadcast task
+    asyncio.create_task(broadcast_match_updates(match_id))
     
-    logger.info(f"Started session {session_id} with {len(request.urls)} URLs")
+    logger.info(f"Created match {match_id}: {match_name}")
     
-    return SessionResponse(
-        sessionId=session_id,
+    return MatchResponse(
+        matchId=match_id,
+        matchName=match_name,
         status="started",
         message=f"Monitoring {len(request.urls)} sportsbooks"
     )
 
 
-@app.post("/stop")
-async def stop_session(sessionId: str):
-    """Stop an active session"""
-    if sessionId not in active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
+@app.get("/matches")
+async def get_all_matches():
+    """Get all matches"""
+    match_summaries = []
     
-    session = active_sessions[sessionId]
-    comparator = session["comparator"]
-    
-    # Signal to stop
-    comparator.running = False
-    session["status"] = "stopped"
-    
-    logger.info(f"Stopped session {sessionId}")
-    
-    return SessionResponse(
-        sessionId=sessionId,
-        status="stopped",
-        message="Monitoring stopped"
-    )
-
-
-@app.get("/session/{sessionId}/status")
-async def get_session_status(sessionId: str):
-    """Get current session status and latest data"""
-    if sessionId not in active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session = active_sessions[sessionId]
-    comparator = session["comparator"]
-    
-    # Get current odds data
-    with comparator.odds_lock:
-        current_odds = dict(comparator.current_odds)
-    
-    # Get latest arbitrage
-    latest_arbitrage = None
-    if comparator.odds_history['arbitrage_opportunities']:
-        latest_arbitrage = comparator.odds_history['arbitrage_opportunities'][-1]['arbitrage']
-    
-    return {
-        "sessionId": sessionId,
-        "status": session["status"],
-        "startTime": session["start_time"],
-        "currentOdds": current_odds,
-        "latestArbitrage": latest_arbitrage,
-        "totalComparisons": len(comparator.odds_history['comparisons']),
-        "totalArbitrageOpportunities": len(comparator.odds_history['arbitrage_opportunities']),
-        "matchStatus": comparator.match_status
-    }
-
-
-@app.get("/session/{sessionId}/health")
-async def get_session_health(sessionId: str):
-    """Get health summary for a session"""
-    if sessionId not in active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session = active_sessions[sessionId]
-    comparator = session["comparator"]
-    
-    health = comparator.get_health_summary()
-    return health
-
-
-@app.get("/session/{sessionId}/history")
-async def get_session_history(sessionId: str):
-    """Get full comparison history for a session"""
-    if sessionId not in active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session = active_sessions[sessionId]
-    comparator = session["comparator"]
-    
-    return {
-        "sessionId": sessionId,
-        "history": comparator.odds_history
-    }
-
-
-@app.delete("/session/{sessionId}")
-async def delete_session(sessionId: str):
-    """Delete a session and clean up resources"""
-    if sessionId not in active_sessions:
-        raise HTTPException(status_code=404, detail="Session not found")
-    
-    session = active_sessions[sessionId]
-    
-    # Stop if still running
-    if session["status"] == "running":
-        comparator = session["comparator"]
-        comparator.running = False
-        time.sleep(1)  # Give it a moment to stop
-    
-    # Remove from active sessions
-    del active_sessions[sessionId]
-    
-    # Clean up websocket connections
-    if sessionId in websocket_connections:
-        del websocket_connections[sessionId]
-    
-    logger.info(f"Deleted session {sessionId}")
-    
-    return {"message": f"Session {sessionId} deleted"}
-
-
-@app.get("/sessions")
-async def list_sessions():
-    """List all active sessions"""
-    sessions = []
-    for session_id, session in active_sessions.items():
-        sessions.append({
-            "sessionId": session_id,
-            "status": session["status"],
-            "startTime": session["start_time"],
-            "urlCount": len(session["urls"]),
-            "totalComparisons": len(session["comparator"].odds_history['comparisons']),
-            "totalArbitrageOpportunities": len(session["comparator"].odds_history['arbitrage_opportunities'])
-        })
-    
-    return {"sessions": sessions, "count": len(sessions)}
-
-
-# WebSocket endpoint for real-time updates
-@app.websocket("/ws/{sessionId}")
-async def websocket_endpoint(websocket: WebSocket, sessionId: str):
-    """WebSocket endpoint for real-time session updates"""
-    if sessionId not in active_sessions:
-        await websocket.close(code=1008, reason="Session not found")
-        return
-    
-    await websocket.accept()
-    
-    # Register this connection
-    if sessionId not in websocket_connections:
-        websocket_connections[sessionId] = []
-    websocket_connections[sessionId].append(websocket)
-    
-    logger.info(f"WebSocket client connected to session {sessionId}")
-    
-    try:
-        # Send initial state
-        session = active_sessions[sessionId]
-        comparator = session["comparator"]
+    for match_id, match in active_matches.items():
+        comparator = match["comparator"]
         
         with comparator.odds_lock:
             current_odds = dict(comparator.current_odds)
@@ -501,31 +326,141 @@ async def websocket_endpoint(websocket: WebSocket, sessionId: str):
         if comparator.odds_history['arbitrage_opportunities']:
             latest_arbitrage = comparator.odds_history['arbitrage_opportunities'][-1]['arbitrage']
         
-        await websocket.send_json({
-            "type": "initial",
-            "sessionId": sessionId,
-            "status": session["status"],
-            "currentOdds": current_odds,
-            "latestArbitrage": latest_arbitrage,
-            "totalComparisons": len(comparator.odds_history['comparisons']),
-            "totalArbitrageOpportunities": len(comparator.odds_history['arbitrage_opportunities']),
-            "matchStatus": comparator.match_status
-        })
+        health = comparator.get_health_summary()
         
-        # Keep connection alive and listen for client messages
+        match_summaries.append({
+            "matchId": match_id,
+            "matchName": match["matchName"],
+            "sport": match.get("sport"),
+            "status": match["status"],
+            "startTime": match["startTime"],
+            "urlCount": len(match["urls"]),
+            "currentArbitrage": latest_arbitrage,
+            "totalOpportunities": len(comparator.odds_history['arbitrage_opportunities']),
+            "activeBooks": health['active'],
+            "staleBooks": health['stale']
+        })
+    
+    return {"matches": match_summaries, "count": len(match_summaries)}
+
+
+@app.get("/match/{matchId}")
+async def get_match_details(matchId: str):
+    """Get detailed information about a specific match"""
+    if matchId not in active_matches:
+        raise HTTPException(status_code=404, detail="Match not found")
+    
+    match = active_matches[matchId]
+    comparator = match["comparator"]
+    
+    with comparator.odds_lock:
+        current_odds = dict(comparator.current_odds)
+    
+    latest_arbitrage = None
+    if comparator.odds_history['arbitrage_opportunities']:
+        latest_arbitrage = comparator.odds_history['arbitrage_opportunities'][-1]['arbitrage']
+    
+    return {
+        "matchId": matchId,
+        "matchName": match["matchName"],
+        "sport": match.get("sport"),
+        "status": match["status"],
+        "startTime": match["startTime"],
+        "currentOdds": current_odds,
+        "latestArbitrage": latest_arbitrage,
+        "totalComparisons": len(comparator.odds_history['comparisons']),
+        "totalArbitrageOpportunities": len(comparator.odds_history['arbitrage_opportunities']),
+        "matchStatus": comparator.match_status
+    }
+
+
+@app.post("/match/{matchId}/stop")
+async def stop_match(matchId: str):
+    """Stop a specific match"""
+    if matchId not in active_matches:
+        raise HTTPException(status_code=404, detail="Match not found")
+    
+    match = active_matches[matchId]
+    comparator = match["comparator"]
+    
+    comparator.running = False
+    match["status"] = "stopped"
+    
+    logger.info(f"Stopped match {matchId}")
+    
+    return MatchResponse(
+        matchId=matchId,
+        matchName=match["matchName"],
+        status="stopped",
+        message="Match stopped"
+    )
+
+
+@app.delete("/match/{matchId}")
+async def delete_match(matchId: str):
+    """Delete a match"""
+    if matchId not in active_matches:
+        raise HTTPException(status_code=404, detail="Match not found")
+    
+    match = active_matches[matchId]
+    
+    # Stop if running
+    if match["status"] == "running":
+        comparator = match["comparator"]
+        comparator.running = False
+        time.sleep(1)
+    
+    # Remove match
+    del active_matches[matchId]
+    
+    logger.info(f"Deleted match {matchId}")
+    
+    return {"message": f"Match {matchId} deleted"}
+
+
+# WebSocket for real-time updates
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time updates"""
+    await websocket.accept()
+    websocket_connections.append(websocket)
+    
+    logger.info(f"WebSocket client connected (total: {len(websocket_connections)})")
+    
+    try:
+        # Send initial state for all matches
+        for match_id, match in active_matches.items():
+            comparator = match["comparator"]
+            
+            with comparator.odds_lock:
+                current_odds = dict(comparator.current_odds)
+            
+            latest_arbitrage = None
+            if comparator.odds_history['arbitrage_opportunities']:
+                latest_arbitrage = comparator.odds_history['arbitrage_opportunities'][-1]['arbitrage']
+            
+            await websocket.send_json({
+                "type": "initial",
+                "matchId": match_id,
+                "matchName": match["matchName"],
+                "status": match["status"],
+                "currentOdds": current_odds,
+                "latestArbitrage": latest_arbitrage,
+                "totalComparisons": len(comparator.odds_history['comparisons']),
+                "totalArbitrageOpportunities": len(comparator.odds_history['arbitrage_opportunities']),
+                "matchStatus": comparator.match_status
+            })
+        
         while True:
             data = await websocket.receive_text()
-            # Could handle client messages here if needed
             
     except WebSocketDisconnect:
-        logger.info(f"WebSocket client disconnected from session {sessionId}")
+        logger.info(f"WebSocket client disconnected")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
     finally:
-        # Unregister connection
-        if sessionId in websocket_connections:
-            if websocket in websocket_connections[sessionId]:
-                websocket_connections[sessionId].remove(websocket)
+        if websocket in websocket_connections:
+            websocket_connections.remove(websocket)
 
 
 if __name__ == "__main__":
