@@ -10,6 +10,7 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Alert, AlertDescription } from '@/components/ui/alert';
+import { MatchSearchDialog } from '@/components/ui/matchSearchDialog';
 
 interface Match {
     matchId: string;
@@ -178,100 +179,112 @@ export default function DashboardPage() {
                     <p className="text-muted-foreground">Monitor multiple matches for arbitrage opportunities</p>
                 </div>
 
-                <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
-                    <DialogTrigger asChild>
-                        <Button size="lg">
-                            <Plus className="h-4 w-4 mr-2" />
-                            New Match
-                        </Button>
-                    </DialogTrigger>
-                    <DialogContent className="max-w-2xl">
-                        <DialogHeader>
-                            <DialogTitle>Create New Match</DialogTitle>
-                            <DialogDescription>
-                                Add URLs from different sportsbooks for the same match to monitor for arbitrage opportunities
-                            </DialogDescription>
-                        </DialogHeader>
+                {/* Action Buttons */}
+                <div className="flex gap-3">
+                    <MatchSearchDialog
+                        onSelectUrls={(selectedUrls, selectedMatchName, selectedSport) => {
+                            setUrls(selectedUrls);
+                            setMatchName(selectedMatchName || '');
+                            setSport(selectedSport || '');
+                            setDialogOpen(true);
+                        }}
+                    />
 
-                        <div className="space-y-4 py-4">
-                            {error && (
-                                <Alert variant="destructive">
-                                    <AlertDescription>{error}</AlertDescription>
-                                </Alert>
-                            )}
+                    <Dialog open={dialogOpen} onOpenChange={setDialogOpen}>
+                        <DialogTrigger asChild>
+                            <Button size="lg">
+                                <Plus className="h-4 w-4 mr-2" />
+                                New Match
+                            </Button>
+                        </DialogTrigger>
+                        <DialogContent className="max-w-2xl">
+                            <DialogHeader>
+                                <DialogTitle>Create New Match</DialogTitle>
+                                <DialogDescription>
+                                    Add URLs from different sportsbooks for the same match to monitor for arbitrage opportunities
+                                </DialogDescription>
+                            </DialogHeader>
 
-                            <div className="space-y-2">
-                                <Label htmlFor="matchName">Match Name (optional)</Label>
-                                <Input
-                                    id="matchName"
-                                    placeholder="e.g., Lakers vs Warriors"
-                                    value={matchName}
-                                    onChange={(e) => setMatchName(e.target.value)}
-                                />
+                            <div className="space-y-4 py-4">
+                                {error && (
+                                    <Alert variant="destructive">
+                                        <AlertDescription>{error}</AlertDescription>
+                                    </Alert>
+                                )}
+
+                                <div className="space-y-2">
+                                    <Label htmlFor="matchName">Match Name (optional)</Label>
+                                    <Input
+                                        id="matchName"
+                                        placeholder="e.g., Lakers vs Warriors"
+                                        value={matchName}
+                                        onChange={(e) => setMatchName(e.target.value)}
+                                    />
+                                </div>
+
+                                <div className="space-y-2">
+                                    <Label htmlFor="sport">Sport (optional)</Label>
+                                    <Input
+                                        id="sport"
+                                        placeholder="e.g., NBA, Tennis, Soccer"
+                                        value={sport}
+                                        onChange={(e) => setSport(e.target.value)}
+                                    />
+                                </div>
+
+                                <div className="space-y-2">
+                                    <Label>Sportsbook URLs</Label>
+                                    {urls.map((url, index) => (
+                                        <div key={index} className="flex gap-2">
+                                            <Input
+                                                type="text"
+                                                value={url}
+                                                onChange={(e) => updateUrl(index, e.target.value)}
+                                                placeholder="https://sportsbook.example.com/event/..."
+                                            />
+                                            {urls.length > 2 && (
+                                                <Button
+                                                    variant="outline"
+                                                    size="icon"
+                                                    onClick={() => removeUrlField(index)}
+                                                >
+                                                    <Trash2 className="h-4 w-4" />
+                                                </Button>
+                                            )}
+                                        </div>
+                                    ))}
+                                    <Button
+                                        variant="outline"
+                                        onClick={addUrlField}
+                                        className="w-full"
+                                    >
+                                        <Plus className="h-4 w-4 mr-2" />
+                                        Add URL
+                                    </Button>
+                                </div>
                             </div>
 
-                            <div className="space-y-2">
-                                <Label htmlFor="sport">Sport (optional)</Label>
-                                <Input
-                                    id="sport"
-                                    placeholder="e.g., NBA, Tennis, Soccer"
-                                    value={sport}
-                                    onChange={(e) => setSport(e.target.value)}
-                                />
-                            </div>
-
-                            <div className="space-y-2">
-                                <Label>Sportsbook URLs</Label>
-                                {urls.map((url, index) => (
-                                    <div key={index} className="flex gap-2">
-                                        <Input
-                                            type="text"
-                                            value={url}
-                                            onChange={(e) => updateUrl(index, e.target.value)}
-                                            placeholder="https://sportsbook.example.com/event/..."
-                                        />
-                                        {urls.length > 2 && (
-                                            <Button
-                                                variant="outline"
-                                                size="icon"
-                                                onClick={() => removeUrlField(index)}
-                                            >
-                                                <Trash2 className="h-4 w-4" />
-                                            </Button>
-                                        )}
-                                    </div>
-                                ))}
+                            <DialogFooter>
                                 <Button
                                     variant="outline"
-                                    onClick={addUrlField}
-                                    className="w-full"
+                                    onClick={() => {
+                                        setDialogOpen(false);
+                                        setError(null);
+                                    }}
+                                    disabled={creating}
                                 >
-                                    <Plus className="h-4 w-4 mr-2" />
-                                    Add URL
+                                    Cancel
                                 </Button>
-                            </div>
-                        </div>
-
-                        <DialogFooter>
-                            <Button
-                                variant="outline"
-                                onClick={() => {
-                                    setDialogOpen(false);
-                                    setError(null);
-                                }}
-                                disabled={creating}
-                            >
-                                Cancel
-                            </Button>
-                            <Button
-                                onClick={createMatch}
-                                disabled={creating}
-                            >
-                                {creating ? 'Creating...' : 'Create Match'}
-                            </Button>
-                        </DialogFooter>
-                    </DialogContent>
-                </Dialog>
+                                <Button
+                                    onClick={createMatch}
+                                    disabled={creating}
+                                >
+                                    {creating ? 'Creating...' : 'Create Match'}
+                                </Button>
+                            </DialogFooter>
+                        </DialogContent>
+                    </Dialog>
+                </div>
             </div>
 
             {/* Error Alert */}
@@ -337,10 +350,20 @@ export default function DashboardPage() {
                         <Activity className="h-16 w-16 mx-auto mb-4 opacity-50" />
                         <h3 className="text-lg font-semibold mb-2">No matches yet</h3>
                         <p className="text-muted-foreground mb-4">Create your first match to start monitoring for arbitrage opportunities</p>
-                        <Button onClick={() => setDialogOpen(true)}>
-                            <Plus className="h-4 w-4 mr-2" />
-                            Create Match
-                        </Button>
+                        <div className="flex gap-3 justify-center">
+                            <MatchSearchDialog
+                                onSelectUrls={(selectedUrls, selectedMatchName, selectedSport) => {
+                                    setUrls(selectedUrls);
+                                    setMatchName(selectedMatchName || '');
+                                    setSport(selectedSport || '');
+                                    setDialogOpen(true);
+                                }}
+                            />
+                            <Button onClick={() => setDialogOpen(true)}>
+                                <Plus className="h-4 w-4 mr-2" />
+                                Create Match
+                            </Button>
+                        </div>
                     </CardContent>
                 </Card>
             ) : (

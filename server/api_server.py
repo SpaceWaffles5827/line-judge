@@ -13,6 +13,21 @@ from datetime import datetime
 from collections import defaultdict
 import logging
 
+from scrapers import ScraperFactory
+import re
+
+
+class SearchMatchRequest(BaseModel):
+    playerName: str
+    sportsbooks: List[str]  # e.g., ["mgm", "pinnacle"]
+
+
+class SearchMatchResult(BaseModel):
+    sportsbook: str
+    matches: List[Dict[str, Any]]
+    error: Optional[str] = None
+
+
 from linejudge import OddsComparator
 
 logging.basicConfig(level=logging.INFO)
@@ -462,6 +477,183 @@ async def websocket_endpoint(websocket: WebSocket):
         if websocket in websocket_connections:
             websocket_connections.remove(websocket)
 
+def search_matches_on_sportsbook(sportsbook: str, player_name: str) -> Dict[str, Any]:
+    """Search for matches containing a player name on a specific sportsbook"""
+    
+    # Base URLs for different sportsbooks
+    base_urls = {
+        "mgm": "https://www.nv.betmgm.com/en/sports/tennis-5",
+        "pinnacle": "https://www.pinnacle.com/en/tennis/matchups/",
+    }
+    
+    if sportsbook.lower() not in base_urls:
+        return {
+            "sportsbook": sportsbook,
+            "matches": [],
+            "error": f"Sportsbook '{sportsbook}' not supported"
+        }
+    
+    try:
+        url = base_urls[sportsbook.lower()]
+        factory = ScraperFactory()
+        scraper = factory.get_scraper(url)
+        
+        if not scraper:
+            return {
+                "sportsbook": sportsbook,
+                "matches": [],
+                "error": f"No scraper available for {sportsbook}"
+            }
+        
+        # Get the page content
+        scraper.fetch_page()
+        
+        # Try to find matches with the player name
+        # This is a basic implementation - you'll need to customize based on each site's structure
+        matches_found = []
+        
+        if sportsbook.lower() == "mgm":
+            # MGM-specific scraping logic
+            matches_found = search_mgm_matches(scraper, player_name)
+        elif sportsbook.lower() == "pinnacle":
+            # Pinnacle-specific scraping logic
+            matches_found = search_pinnacle_matches(scraper, player_name)
+        
+        return {
+            "sportsbook": sportsbook,
+            "matches": matches_found,
+            "error": None
+        }
+        
+    except Exception as e:
+        logger.error(f"Error searching {sportsbook} for {player_name}: {e}")
+        return {
+            "sportsbook": sportsbook,
+            "matches": [],
+            "error": str(e)
+        }
+
+
+def search_mgm_matches(scraper, player_name: str) -> List[Dict[str, Any]]:
+    """Search MGM for matches containing player name"""
+    matches = []
+    
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(scraper.driver.page_source, 'html.parser')
+        
+        # Find all match elements (you'll need to adjust selectors based on actual HTML)
+        # This is a placeholder - update with actual MGM selectors
+        match_elements = soup.find_all('div', class_='event-wrapper')
+        
+        player_name_lower = player_name.lower()
+        
+        for match_element in match_elements:
+            match_text = match_element.get_text().lower()
+            
+            # Check if player name is in the match
+            if player_name_lower in match_text:
+                # Extract match details
+                try:
+                    # Get match link
+                    link_element = match_element.find('a', href=True)
+                    if link_element:
+                        match_url = link_element['href']
+                        if not match_url.startswith('http'):
+                            match_url = f"https://www.nv.betmgm.com{match_url}"
+                        
+                        # Get player names
+                        player_elements = match_element.find_all('div', class_='participant')
+                        players = [p.get_text().strip() for p in player_elements]
+                        
+                        if len(players) >= 2:
+                            matches.append({
+                                "url": match_url,
+                                "players": players,
+                                "matchName": f"{players[0]} vs {players[1]}",
+                                "sport": "Tennis"
+                            })
+                except Exception as e:
+                    logger.error(f"Error parsing MGM match element: {e}")
+                    continue
+        
+    except Exception as e:
+        logger.error(f"Error searching MGM: {e}")
+    
+    return matches
+
+
+def search_pinnacle_matches(scraper, player_name: str) -> List[Dict[str, Any]]:
+    """Search Pinnacle for matches containing player name"""
+    matches = []
+    
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(scraper.driver.page_source, 'html.parser')
+        
+        # Find all match elements (adjust selectors based on actual HTML)
+        match_elements = soup.find_all('div', class_='contentBlock')
+        
+        player_name_lower = player_name.lower()
+        
+        for match_element in match_elements:
+            match_text = match_element.get_text().lower()
+            
+            if player_name_lower in match_text:
+                try:
+                    # Get match link
+                    link_element = match_element.find('a', href=True)
+                    if link_element:
+                        match_url = link_element['href']
+                        if not match_url.startswith('http'):
+                            match_url = f"https://www.pinnacle.com{match_url}"
+                        
+                        # Get player names
+                        player_spans = match_element.find_all('span', class_='style_participants')
+                        players = [p.get_text().strip() for p in player_spans]
+                        
+                        if len(players) >= 2:
+                            matches.append({
+                                "url": match_url,
+                                "players": players,
+                                "matchName": f"{players[0]} vs {players[1]}",
+                                "sport": "Tennis"
+                            })
+                except Exception as e:
+                    logger.error(f"Error parsing Pinnacle match element: {e}")
+                    continue
+        
+    except Exception as e:
+        logger.error(f"Error searching Pinnacle: {e}")
+    
+    return matches
+
+
+# Add this endpoint
+@app.post("/search/matches")
+async def search_matches(request: SearchMatchRequest):
+    """Search for matches by player name across multiple sportsbooks"""
+    
+    if not request.playerName or len(request.playerName.strip()) < 2:
+        raise HTTPException(status_code=400, detail="Player name must be at least 2 characters")
+    
+    if not request.sportsbooks or len(request.sportsbooks) == 0:
+        raise HTTPException(status_code=400, detail="At least one sportsbook must be specified")
+    
+    logger.info(f"Searching for player '{request.playerName}' on {request.sportsbooks}")
+    
+    results = []
+    
+    # Search each sportsbook
+    for sportsbook in request.sportsbooks:
+        result = search_matches_on_sportsbook(sportsbook, request.playerName)
+        results.append(result)
+    
+    return {
+        "playerName": request.playerName,
+        "results": results,
+        "totalMatches": sum(len(r["matches"]) for r in results)
+    }
 
 if __name__ == "__main__":
     import uvicorn
